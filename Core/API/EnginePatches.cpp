@@ -401,19 +401,21 @@ int ICorePatches::SoundLibrary(void) {
   void (CSoundObject::*pUpdate3DEffects)(void) = &CSoundObject::Update3DEffects;
   CreatePatch(pUpdate3DEffects, &CSoundObjPatch::P_Update3DEffects, "CSoundObject::Update3DEffects()");
 
-// 08 §1 - per-sound DirectSound3D hooks (Steam TSE 1.07 release only)
+// 08 s1 - per-sound DirectSound3D hooks (Steam TSE 1.07 release only)
 #if _PATCHCONFIG_ENGINEPATCHES && SE1_VER == SE1_107 && defined(NDEBUG)
 
-  SoundDS3D_Init(); // 08 §2 - declare the cvars once
+  SoundDS3D_Init(); // 08 s2 - declare the cvars once
 
-  // P_Play_internal (08 §3) - trampoline stored in the static variable
+  // P_Play_internal (08 s3) - trampoline stored in the static variable
   CreatePatch(pDS_Play_internal, &CSoundObjDSPatch::P_Play_internal, "CSoundObject::Play_internal(...)");
 
-  // P_Stop_internal (08 §3) - prologue is not decodable past +4 (07 §13 item 9): 7-byte rewrite
+  // P_Stop_internal (08 s3) - prologue is not decodable past +4 (07 s13 item 9): 7-byte rewrite.
+  // FuncPatch_ForceRewrite(7) applies to the NEXT CreatePatch and resets after it, so the two
+  // lines MUST stay adjacent - never insert another CreatePatch call between them.
   FuncPatch_ForceRewrite(7);
   CreatePatch(pDS_Stop_internal, &CSoundObjDSPatch::P_Stop_internal, "CSoundObject::Stop_internal()");
 
-  // P_dtor (08 §3) - exported 0x7E150, hooked by mangled name (&~CSoundObject is not formable)
+  // P_dtor (08 s3) - exported 0x7E150, hooked by mangled name (&~CSoundObject is not formable)
   void *pvDtor = ClassicsCore_GetEngineSymbol("??1CSoundObject@@QAE@XZ");
 
   if (pvDtor != NULL) {
@@ -421,22 +423,24 @@ int ICorePatches::SoundLibrary(void) {
     CreatePatch(pDS_dtor, &CSoundObjDSPatch::P_dtor, "CSoundObject::~CSoundObject()");
 
   } else {
-    CPrintF("DS3D: CSoundObject dtor not found - snd_bDS3DSpatial refused\n"); // 08 §3 refusal
+    _bDS3DHooksOk = FALSE; // 08 s6 - refuse the mode; step 3 gates registration on this
+    CPrintF("DS3D: CSoundObject dtor not found - snd_bDS3DSpatial refused\n"); // 08 s3 refusal
   }
 
-  // P_UpdateSounds / P_SetFormat / P_Mute / P_ClearBuffer (08 §3)
+  // P_UpdateSounds / P_SetFormat / P_Mute / P_ClearBuffer (08 s3)
   CreatePatch(pDS_UpdateSounds, &CSoundLibDSPatch::P_UpdateSounds, "CSoundLibrary::UpdateSounds()");
   CreatePatch(pDS_SetFormat, &CSoundLibDSPatch::P_SetFormat, "CSoundLibrary::SetFormat(...)");
   CreatePatch(pDS_Mute, &CSoundLibDSPatch::P_Mute, "CSoundLibrary::Mute()");
   CreatePatch(pDS_ClearBuffer, &CSoundDataDSPatch::P_ClearBuffer, "CSoundData::ClearBuffer()");
 
-  // P_MixSound (08 §3) - raw address; byte-compare + module identity BEFORE patching
+  // P_MixSound (08 s3) - raw address; byte-compare + module identity BEFORE patching
   pDS_MixSound = (void (*)(CSoundObject *))(ADDR_ENGINE + 0x7AF80);
 
   if (SoundDS3D_CheckMixSound()) {
     CreatePatch(pDS_MixSound, &PDS_MixSound, "CSoundObject::MixSound(...)");
 
   } else {
+    _bDS3DHooksOk = FALSE; // 08 s6 - refuse the mode; step 3 gates registration on this
     CPrintF("DS3D: MixSound prologue/module check failed - snd_bDS3DSpatial refused\n"); // invariant 3
   }
 #endif // _PATCHCONFIG_ENGINEPATCHES && SE1_VER == SE1_107 && defined(NDEBUG)
