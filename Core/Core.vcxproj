@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug_TSE107|Win32">
@@ -92,6 +92,7 @@
     <ClInclude Include="Patches\Network.h" />
     <ClInclude Include="Patches\Rendering.h" />
     <ClInclude Include="Patches\Ska.h" />
+<ClInclude Include="Patches\SoundDS3D.h" />
     <ClInclude Include="Patches\SoundLibrary.h" />
     <ClInclude Include="Patches\Strings.h" />
     <ClInclude Include="Patches\Textures.h" />
@@ -164,6 +165,7 @@
     <ClCompile Include="Patches\Network.cpp" />
     <ClCompile Include="Patches\Rendering.cpp" />
     <ClCompile Include="Patches\Ska.cpp" />
+    <ClCompile Include="Patches\SoundDS3D.cpp" />
     <ClCompile Include="Patches\SoundLibrary.cpp" />
     <ClCompile Include="Patches\Strings.cpp" />
     <ClCompile Include="Patches\Textures.cpp" />

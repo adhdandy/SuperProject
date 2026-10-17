@@ -16,6 +16,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "StdH.h"
 
 #include "SoundLibrary.h"
+#include "SoundDS3D.h"
 
 #if _PATCHCONFIG_ENGINEPATCHES
 
@@ -242,5 +243,64 @@ void CSoundObjPatch::P_Update3DEffects(void)
     SetPhase(fPhaseShift);
   }
 };
+
+// 08 §3 - DirectSound3D wrapper hooks (Steam TSE 1.07 release only, 08 §1)
+#if SE1_VER == SE1_107 && defined(NDEBUG)
+
+// 06 §10.1/§10.3 - trampoline variables (static storage duration, AGENTS invariant 4;
+// static-typed PMFs hold the concrete address on MSVC x86 - 06 §10.3). CreatePatch()
+// in ICorePatches::SoundLibrary() (EnginePatches.cpp) rewrites each variable to hold
+// the trampoline; the dtor and MixSound addresses are filled at registration time.
+void (CSoundObject::*pDS_Play_internal)(CSoundData *, SLONG) = &CSoundObject::Play_internal;
+void (CSoundObject::*pDS_Stop_internal)(void) = &CSoundObject::Stop_internal;
+void (CSoundObject::*pDS_dtor)(void) = NULL;                               // filled with the 0x7E150 export at registration
+void (CSoundLibrary::*pDS_UpdateSounds)(void) = &CSoundLibrary::UpdateSounds;
+CSoundLibrary::SoundFormat (CSoundLibrary::*pDS_SetFormat)(CSoundLibrary::SoundFormat, BOOL) = &CSoundLibrary::SetFormat;
+void (CSoundLibrary::*pDS_Mute)(void) = &CSoundLibrary::Mute;
+void (CSoundData::*pDS_ClearBuffer)(void) = &CSoundData::ClearBuffer;
+void (*pDS_MixSound)(CSoundObject *) = NULL;                               // filled with ADDR_ENGINE + 0x7AF80 at registration
+
+// 08 §3 P_MixSound (free function, SoundLibrary.h:47) - step 1: mode off, shadow
+// table empty -> always the stock mixer; the bBypass skip lands in step 3
+void PDS_MixSound(CSoundObject *pso) {
+  pDS_MixSound(pso);
+};
+
+// 08 §3 P_Play_internal - step 1: passthrough; eligibility + table registration in step 3
+void CSoundObjDSPatch::P_Play_internal(CSoundData *pCsdLink, SLONG slFlags) {
+  (this->*pDS_Play_internal)(pCsdLink, slFlags);
+};
+
+// 08 §3 P_Stop_internal - step 1: passthrough; orphan detach in step 3
+void CSoundObjDSPatch::P_Stop_internal(void) {
+  (this->*pDS_Stop_internal)();
+};
+
+// 08 §3 P_dtor - step 1: original only (shadow release lands in step 4, BEFORE the original)
+void CSoundObjDSPatch::P_dtor(void) {
+  (this->*pDS_dtor)();
+};
+
+// 08 §3 P_UpdateSounds - step 1: original only; the §4 driver tail lands in step 3
+void CSoundLibDSPatch::P_UpdateSounds(void) {
+  (this->*pDS_UpdateSounds)();
+};
+
+// 08 §3 P_SetFormat - step 1: passthrough (re-init robustness in step 6)
+CSoundLibrary::SoundFormat CSoundLibDSPatch::P_SetFormat(CSoundLibrary::SoundFormat EsfNew, BOOL bReload) {
+  return (this->*pDS_SetFormat)(EsfNew, bReload);
+};
+
+// 08 §3 P_Mute - step 1: passthrough (shadow gate-stop lands in step 5)
+void CSoundLibDSPatch::P_Mute(void) {
+  (this->*pDS_Mute)();
+};
+
+// 08 §3 P_ClearBuffer - step 1: passthrough (template release in step 3)
+void CSoundDataDSPatch::P_ClearBuffer(void) {
+  (this->*pDS_ClearBuffer)();
+};
+
+#endif // SE1_VER == SE1_107 && defined(NDEBUG)
 
 #endif // _PATCHCONFIG_ENGINEPATCHES
