@@ -1,40 +1,51 @@
-# Build (ClassicsCore.dll, Release_TSE107)
+# Build (SamClassicPatch.sln, Release_TSE107, x86)
 
-Reproducible **Core-only** build: all DS3D changes live in `ClassicsCore.dll`, so only
-the `Core` solution project is built (other projects are not, see quirks).
+Reproducible **full-solution** build with the **native** toolchain so every binary
+matches the Steam release ABI (VC6 runtime, `MSVCP60`/`MSVCRT` imports).
 
 ## Prerequisites
-- Visual Studio 2022 17.x with `Microsoft.Component.MSBuild` and
-  `Microsoft.VisualStudio.Component.VC.Tools.x86.x64` (provides toolset v143).
-- Windows SDK 10 with x86 um/ucrt libs + rc.exe (present: 10.0.19041.0).
-- `vswhere.exe` (ships with VS).
-- MFC is NOT needed for this Core-only scope; a full-solution build needs
-  `Microsoft.VisualStudio.Component.VC.ATLMFC`.
-- Submodules: `git submodule update --init --recursive` (API, Includes, Extras\XGizmo).
+Per the SE1-ModSDK wiki (`DreamyCecil/SE1-ModSDK`, page *Building*):
+1. **Microsoft Visual C++ 6.0** with **Service Pack 6** (the real compiler).
+2. **Visual Studio 2010** with the *Visual C++* workload (`vcxproj` build system).
+3. **Daffodil** (`manusoft-daffodil` R2.6.6 MSI) — adds the `v60` platform toolset
+   to VS2010:
+   https://github.com/manusoft-gh/manusoft-daffodil/releases/download/R2.6.6/Daffodil.2.6.6.ENU.msi
+4. Optional: a newer Visual Studio for the IDE (the script uses MSBuild 4.0).
+5. Submodules: `git submodule update --init --recursive` (API, Includes, Extras\XGizmo).
+
+The per-project `Release_TSE107` configurations already select `PlatformToolset`
+`v60`; **do not** override the toolset on the command line.
 
 ## Command
-    MSBuild SamClassicPatch.sln /t:Core /nologo /m /p:Configuration=Release_TSE107 ^
-        /p:Platform=x86 /p:PlatformToolset=v143
-Output: `Bin\Release_TSE107\ClassicsCore.dll`.
+    MSBuild SamClassicPatch.sln /nologo /m /p:Configuration=Release_TSE107 /p:Platform=x86
+
+`build.ps1` locates MSBuild 4.0 (`%WINDIR%\Microsoft.NET\Framework\v4.0.30319`),
+verifies VS2010 + the Daffodil `v60` toolset are installed, and throws a precise
+prerequisite list if any is missing.
 
 ## Usage
-    .\build.ps1                 # build
-    .\build.ps1 -Deploy         # build + copy outputs to ..\testbed\Bin
-    .\build.ps1 -Config Release_TSE107
-Exit code = MSBuild result; console shows only errors (max 40), status, elapsed, and
-the SHA-256 + timestamp of ClassicsCore.dll.
+    .\build.ps1                 # full solution -> build.log
+    .\build.ps1 -Clean          # wipe Obj\ and Bin\ for this config first
+    .\build.ps1 -Deploy         # build, then stage outputs into ..\deploy\Bin
+    .\build.ps1 -Deploy -DeployTo D:\stage
+Exit code = MSBuild result. Console shows per-project PASS/FAIL, errors (max 40),
+status/elapsed, and the SHA-256 + timestamp of `ClassicsCore.dll`.
 
 ## Deploy
-Target `..\testbed\Bin` (junction to the Steam TSE install). `-Deploy` aborts unless
-the path contains "testbed", and copies only outputs produced by this run, so the
-testbed's other (API-compatible) binaries are never overwritten.
+`-Deploy` stages only the `Bin` outputs listed in `DeployToBin - Release.bat`
+(the mod `Mods` robocopy and resource packing are not staged).
+
+The target path is **resolved through junctions** and the deploy is refused if it
+lands under a Steam library (`steamapps\common`). `testbed\` is a junction into the
+live Steam install, so the default staging target is `..\deploy\Bin`; copy the
+staged files into the testbed yourself.
 
 ## Known quirks
-- `.vcxproj` still says `PlatformToolset` v60/v120; build.ps1 passes v143 on the
-  command line instead of editing the project.
-- Other projects (`SeriousSam_Custom.exe`, `Game_Custom.dll`, ...) are NOT rebuilt:
-  they already exist in the testbed and must stay API-compatible with Core.
-- Full-solution builds currently fail on missing MFC (`afxres.h`).
+- `.vcxproj` `PlatformToolset` for `Release_TSE107` is `v60` (other configs `v120`).
+- Full-solution builds need the projects' MFC/ATL resources (e.g. `afxres.h`).
+- `Core/Patches/SoundDS3D.*` and the rest of Core are C++98-clean (the only C++11
+  shims are guarded by `_MSC_VER` in `Core/API/ISteam.h`).
 
 ## build.log
-Full output goes to `build.log`; search with `Select-String -Path build.log -Pattern ': error'`.
+Full output goes to `build.log`; search with
+`Select-String -Path build.log -Pattern ': error'`.
