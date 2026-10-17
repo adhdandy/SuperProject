@@ -21,6 +21,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "Networking/Modules/ClientLogging.h"
 
 #include <STLIncludesBegin.h>
+#include <functional> // [Cecil] DS3D: binary_function not included via <map> anymore
 #include <map>
 #include <STLIncludesEnd.h>
 
