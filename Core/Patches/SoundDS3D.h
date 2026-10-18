@@ -58,6 +58,60 @@ extern INDEX _snd_bUseEnvironmentFX; // snd_bUseEnvironmentFX, default 1 (99 #13
 // 08 s6 - FALSE if any hook failed its install check; step 3 registration gates on it
 extern BOOL _bDS3DHooksOk;
 
+// 08 s8 - cached DS template per CSoundData (07 sG1: built lazily from sd_pswBuffer
+// via Lock/Unlock, PCM copied once; flags per 99 #14 + guid3DAlgorithm from
+// snd_iEmulationType). Invalidated by P_ClearBuffer, freed on P_SetFormat. Lookup
+// validates the fields against the live CSoundData and rebuilds on mismatch (07 s13
+// item 13 - guards CSoundData address reuse if a ClearBuffer path is ever missed).
+struct DS3DTemplate {
+  LPDIRECTSOUNDBUFFER pbuf;
+  SWORD *pswPCM;         // sd_pswBuffer at build time (validation only)
+  INDEX iBytes;          // sd_slBufferSampleSize * channels * 2
+  INDEX iRate;           // sd_wfeFormat.nSamplesPerSec
+  INDEX iChannels;       // sd_wfeFormat.nChannels
+};
+
+// 08 s8 - one registered shadow per CSoundObject.
+// psdKey is an OPAQUE map key only - never dereference it (07 s13 item 12). The live
+// data pointer is always psoOwner->so_pCsdLink (valid while SOF_PLAY); refresh order
+// at (re)commit: !SOF_PLAY validation -> read so_pCsdLink -> refresh the cached fields
+// (07 s13 item 17). Stored spatial fields initialize to parked (02 s1) as the
+// bSpatialValid backstop.
+struct DS3DShadow {
+  CSoundObject *psoOwner;
+  CSoundData *psdKey;            // opaque key (07 s13 item 12)
+  LPDIRECTSOUNDBUFFER pBuffer;
+  LPDIRECTSOUND3DBUFFER pBuffer3D;
+  LPKSPROPERTYSET pKsProps;      // NULL when EAX is unavailable (non-fatal - 08 s4 step 9)
+  BOOL bLooping;                 // SOF_LOOP at registration (99 #16)
+  BOOL bStarted;                 // Play issued on the current buffer (99 #17)
+  BOOL bDelayPending;            // sp_fDelay not yet elapsed (07 s13 item 16)
+  BOOL bSpatialValid;            // set by the P_Update3DEffects store (07 s13 item 18)
+  BOOL bBypass;                  // P_MixSound skips only when set (07 s13 item 19)
+  BOOL bGateStopped;             // step-4 gate consumed by the re-Play (07 s13 item 20)
+  BOOL bReplay;                  // P_Play_internal: stale buffer pending release
+  FLOAT3D vPos;                  // stored listener-space position, engine space (02 s2)
+  FLOAT3D vVel;                  // stored listener-space velocity (02 s5)
+  FLOAT fLastVolume;             // stored engine volume 0..1, pre-master (08 s4 step 6)
+  FLOAT fLastFilter;             // stored hf factor (DirectHF source, 99 #13)
+  INDEX iRate;                   // cached from the play args (08 s8, 99 #11)
+  INDEX iChannels;
+  INDEX iBytesPerFrame;
+  INDEX iFailFrames;             // step-4 failure policy
+  DOUBLE tmSilentSince;          // step-5 D8 silent-since timer (07 s13 item 24)
+};
+
+// 08 s3 - hook bodies for CSoundObjDSPatch / CSoundDataDSPatch / CSoundLibDSPatch
+// (definitions in SoundDS3D.cpp, called from Patches/SoundLibrary.cpp). Game thread,
+// all table mutations under sl_csSound (inherited from the hook's caller or taken
+// explicitly; OPTEX is recursive - 08 s7).
+void DS3D_OnPlayPre(CSoundObject *pso, CSoundData *psd, SLONG slFlags);
+void DS3D_OnPlayPost(CSoundObject *pso);
+void DS3D_OnStop(CSoundObject *pso);
+void DS3D_OnDtor(CSoundObject *pso);
+void DS3D_OnClearBuffer(CSoundData *psd);
+void DS3D_OnSetFormatPre(void);
+
 // 08 s11 step 1 - declares the cvars; called from ICorePatches::SoundLibrary()
 void SoundDS3D_Init(void);
 

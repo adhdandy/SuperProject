@@ -260,45 +260,60 @@ void (CSoundLibrary::*pDS_Mute)(void) = &CSoundLibrary::Mute;
 void (CSoundData::*pDS_ClearBuffer)(void) = &CSoundData::ClearBuffer;
 void (*pDS_MixSound)(CSoundObject *) = NULL;                               // filled with ADDR_ENGINE + 0x7AF80 at registration
 
-// 08 s3 P_MixSound (free function, SoundLibrary.h:47) - step 1: mode off, shadow
-// table empty -> always the stock mixer; the bBypass skip lands in step 3
+// 08 s3 P_MixSound (free function, SoundLibrary.h:47) - step 1-2: mode off / not yet
+// skipping, the stock mixer always runs; the bBypass skip lands in step 3
 void PDS_MixSound(CSoundObject *pso) {
   pDS_MixSound(pso);
 };
 
-// 08 s3 P_Play_internal - step 1: passthrough; eligibility + table registration in step 3
+// 08 s3 P_Play_internal - registration happens BEFORE the original (Play holds
+// sl_csSound, the first mix block can never see an unregistered playing sound - 07 s7.4);
+// the inlined Stop_internal inside the original never passes through P_Stop_internal
+// (05 s1.3), so re-play release + the step-2 immediate commit run after it
 void CSoundObjDSPatch::P_Play_internal(CSoundData *pCsdLink, SLONG slFlags) {
+  DS3D_OnPlayPre(this, pCsdLink, slFlags);
+
   (this->*pDS_Play_internal)(pCsdLink, slFlags);
+
+  DS3D_OnPlayPost(this);
 };
 
-// 08 s3 P_Stop_internal - step 1: passthrough; orphan detach in step 3
+// 08 s3 P_Stop_internal - explicit stops only; force release (orphan play-out in step 5)
 void CSoundObjDSPatch::P_Stop_internal(void) {
+  DS3D_OnStop(this);
   (this->*pDS_Stop_internal)();
 };
 
-// 08 s3 P_dtor - step 1: original only (shadow release lands in step 4, BEFORE the original)
+// 08 s3/07 s12.1 P_dtor - release the shadow BEFORE the original (its Stop_internal
+// is inlined, so a destroyed shadowed object would otherwise dangle in the table)
 void CSoundObjDSPatch::P_dtor(void) {
+  DS3D_OnDtor(this);
   (this->*pDS_dtor)();
 };
 
-// 08 s3 P_UpdateSounds - step 1: original only; the s4 driver tail lands in step 3
+// 08 s3 P_UpdateSounds - original only in step 2; the s4 driver tail lands in step 3
 void CSoundLibDSPatch::P_UpdateSounds(void) {
   (this->*pDS_UpdateSounds)();
 };
 
-// 08 s3 P_SetFormat - step 1: passthrough (re-init robustness in step 6)
+// 08 s3 P_SetFormat - step-2 interim: drop every shadow before the device is recreated
+// (software takes over; ReleaseForRecommit + recommit-at-synced-offset lands in step 4/6),
+// the listener parameters re-apply on the fresh device at the next registration (08 s9)
 CSoundLibrary::SoundFormat CSoundLibDSPatch::P_SetFormat(CSoundLibrary::SoundFormat EsfNew, BOOL bReload) {
+  DS3D_OnSetFormatPre();
   return (this->*pDS_SetFormat)(EsfNew, bReload);
 };
 
-// 08 s3 P_Mute - step 1: passthrough (shadow gate-stop lands in step 5)
+// 08 s3 P_Mute - passthrough until the shadow gate-stop lands in step 5
 void CSoundLibDSPatch::P_Mute(void) {
   (this->*pDS_Mute)();
 };
 
-// 08 s3 P_ClearBuffer - step 1: passthrough (template release in step 3)
+// 08 s3 P_ClearBuffer - invalidate the cached template (07 sG1 single invalidation point)
 void CSoundDataDSPatch::P_ClearBuffer(void) {
   (this->*pDS_ClearBuffer)();
+
+  DS3D_OnClearBuffer(this);
 };
 
 #endif // SE1_VER == SE1_107 && defined(NDEBUG)
