@@ -46,12 +46,23 @@ INDEX _snd_bUseEnvironmentFX = 1;
 // MixSound skip = double audio; skip without shadows = silent zombies).
 BOOL _bDS3DHooksOk = TRUE;
 
+// 08 s2/G6 - snd_iEmulationType post: handler (definition below, with the SetFormat
+// hooks). The shell grammar type-checks it as void(INDEX) but passes the ADDRESS of
+// the changed variable (Parser.y base call site; stock precedent SndPostFunc(void*) -
+// SoundLibrary.cpp:173; the patch precedent ignores the argument the same way -
+// Core\Base\ObserverCamera.cpp:513). We read the cvar global itself.
+static void DS3D_EmulationTypeChanged(INDEX);
+
 // 08 s2/s11 step 1 - declared once here; called from ICorePatches::SoundLibrary()
 // (EnginePatches.cpp, 06 s5 pattern). Default snd_bDS3DSpatial = 0: nothing in this
 // subsystem runs, behavior is vanilla.
 void SoundDS3D_Init(void) {
+  // 08 s2/07 s12.4 - declare the function symbol first; the post: tag references it by
+  // name (precedent Core\Base\ObserverCamera.cpp:532-533)
+  _pShell->DeclareSymbol("void DS3D_EmulationTypeChanged(INDEX);", &DS3D_EmulationTypeChanged);
+
   _pShell->DeclareSymbol("persistent user INDEX snd_bDS3DSpatial;",      &_snd_bDS3DSpatial);
-  _pShell->DeclareSymbol("persistent user INDEX snd_iEmulationType;",    &_snd_iEmulationType);
+  _pShell->DeclareSymbol("persistent user INDEX snd_iEmulationType post:DS3D_EmulationTypeChanged;", &_snd_iEmulationType);
   _pShell->DeclareSymbol("persistent user INDEX snd_iMaxVoices;",        &_snd_iMaxVoices);
   _pShell->DeclareSymbol("persistent user INDEX snd_iMaxSameSounds;",    &_snd_iMaxSameSounds);
   _pShell->DeclareSymbol("persistent user INDEX snd_bUseEnvironmentFX;", &_snd_bUseEnvironmentFX);
@@ -600,6 +611,17 @@ void DS3D_OnClearBuffer(CSoundData *psd) {
   }
 };
 
+// 08 s3 G6 - the device is about to be recreated (or the algorithm GUID changed): every
+// template is a buffer on the dying device. Called from the P_SetFormat pre pass and
+// from the snd_iEmulationType post: handler (08 s2); the belt-and-braces pass also
+// covers ClearBuffer paths we may miss
+static void DS3D_FreeTemplates(void) {
+  while (!_mapTemplates.empty()) {
+    if (_mapTemplates.begin()->second.pbuf != NULL) _mapTemplates.begin()->second.pbuf->Release();
+    _mapTemplates.erase(_mapTemplates.begin());
+  }
+};
+
 void DS3D_OnSetFormatPre(void) {
   if (_pSound == NULL) return;
   // the original may be entered without the caller holding sl_csSound
@@ -608,10 +630,7 @@ void DS3D_OnSetFormatPre(void) {
 
   // 08 s3 G6 - the device is about to be recreated: every template is a buffer on the
   // dying device (the belt-and-braces pass also covers ClearBuffer paths we may miss)
-  while (!_mapTemplates.empty()) {
-    if (_mapTemplates.begin()->second.pbuf != NULL) _mapTemplates.begin()->second.pbuf->Release();
-    _mapTemplates.erase(_mapTemplates.begin());
-  }
+  DS3D_FreeTemplates();
 
   // 08 s3 G6 - orphan interfaces die with the device too; release while it is still
   // alive (step-5 orphan play-out list - "mark generation", 07 sG6)
@@ -657,6 +676,30 @@ void DS3D_OnSetFormatPost(void) {
   while (!_mapShadows.empty()) {
     DS3D_DropToSoftware(_mapShadows.begin()->second);
   }
+};
+
+// 08 s2/G6 (07 s12.4) - the snd_iEmulationType change handler. guid3DAlgorithm is baked
+// into every template buffer, so a change takes the re-init path (the beta declares the
+// cvar post: with a SetFormat trigger, 04 s5): free the templates (the P_SetFormat pre
+// pass repeats this sweep under its own lock - belt and braces per 08 s2) and call
+// SetFormat(sl_EsfFormat). The call lands on the patched entry: pre frees orphans and
+// holds every running shadow (ReleaseForRecommit, entries kept, bBypass stays true),
+// post re-applies the listener params (or disables the mode when the listener is gone),
+// and the next driver tail recommits at the synced offsets with the new GUID (RECREATE
+// - 07 s13 item 15). This is what makes the toggle observable on running sounds
+// (99 s4 #6, 08 s11 step 6).
+static void DS3D_EmulationTypeChanged(INDEX) {
+  if (_pSound == NULL) return;
+
+  {
+    // own lock for the cache sweep only - the SetFormat call must acquire tm_csHooks
+    // BEFORE sl_csSound (stock order, SoundLibrary.cpp:952-954) to keep the lock order
+    // consistent with the timer thread (07 sG8)
+    CTSingleLock slSounds(&_pSound->sl_csSound, TRUE);
+    DS3D_FreeTemplates();
+  }
+
+  _pSound->SetFormat(_pSound->sl_EsfFormat);
 };
 
 // 08 s3/08 s4 step 6 (07 sG7 companion) - the Mute window: the original zeroed the mix
