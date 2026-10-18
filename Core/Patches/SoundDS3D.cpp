@@ -40,6 +40,11 @@ INDEX _snd_iMaxSameSounds = 5;
 // 99 #13 - EAX DirectHF gate
 INDEX _snd_bUseEnvironmentFX = 1;
 
+// 07 s16 - post-curve flat gain offset in dB (deviation from beta parity; applied after
+// the 99 #10 curve at 08 s4 step 6, ungated branch only). Clamped -30..0 at read time.
+// Default -4.0 is provisional - the user tunes it at runtime, then it becomes the default.
+FLOAT _snd_fDS3DGain = -4.0f;
+
 // 08 s6 - refusal state. Cleared if any hook in ICorePatches::SoundLibrary() fails its
 // install check (dtor symbol missing, MixSound prologue/module mismatch). Step 3
 // registration gates on this: a partial install is never safe (shadows without the
@@ -66,6 +71,7 @@ void SoundDS3D_Init(void) {
   _pShell->DeclareSymbol("persistent user INDEX snd_iMaxVoices;",        &_snd_iMaxVoices);
   _pShell->DeclareSymbol("persistent user INDEX snd_iMaxSameSounds;",    &_snd_iMaxSameSounds);
   _pShell->DeclareSymbol("persistent user INDEX snd_bUseEnvironmentFX;", &_snd_bUseEnvironmentFX);
+  _pShell->DeclareSymbol("persistent user FLOAT snd_fDS3DGain;",        &_snd_fDS3DGain);
 }
 
 // 08 s3 P_MixSound / AGENTS invariant 3 - the raw address is patched only if the loaded
@@ -967,6 +973,13 @@ static int DS3D_DriveShadow(DS3DShadow *psh, BOOL bGamePaused, FLOAT fVolEff) {
       if (fVol > 1.0f) fVol = 1.0f; // log10 input guard (DS range is [-10000, 0])
       FLOAT fCb = 3000.0f * (fVol * (fVol - 1.0f) + (1.0f - fVol) * (FLOAT)log10((double)fVol));
       slCb = (SLONG)Clamp((LONG)FloatToInt(fCb), (LONG)DSBVOLUME_MIN, (LONG)0);
+
+      // 07 §16, 08 §4 step 6 - post-curve flat user gain offset (deliberate deviation from
+      // beta parity; the 99 #10 curve itself is unchanged). This branch only runs for
+      // fVol > 0.005, so the v <= 0.005 sentinel above stays exactly -10000. The D8 silence
+      // test, voice budget and same-sounds budget above keep the pre-curve volume.
+      FLOAT fGain = Clamp(_snd_fDS3DGain, -30.0f, 0.0f);
+      slCb = (SLONG)Clamp((LONG)slCb + (LONG)FloatToInt(fGain * 100.0f), (LONG)DSBVOLUME_MIN, (LONG)0);
     }
 
     HRESULT hrVol = pbuf->SetVolume(slCb);

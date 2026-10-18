@@ -54,6 +54,7 @@ extern INDEX _snd_iEmulationType;    // snd_iEmulationType, default 0 (99 #14)
 extern INDEX _snd_iMaxVoices;        // snd_iMaxVoices, default 30, clamp 4..64 (99 #15)
 extern INDEX _snd_iMaxSameSounds;    // snd_iMaxSameSounds, default 5, clamp 1..99 (99 #9)
 extern INDEX _snd_bUseEnvironmentFX; // snd_bUseEnvironmentFX, default 1 (99 #13)
+extern FLOAT _snd_fDS3DGain;         // snd_fDS3DGain, default -4.0 dB, clamp -30..0 (07 s16)
 
 // 08 s6 - FALSE if any hook failed its install check; step 3 registration gates on it
 extern BOOL _bDS3DHooksOk;
