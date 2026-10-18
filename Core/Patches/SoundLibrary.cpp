@@ -242,6 +242,12 @@ void CSoundObjPatch::P_Update3DEffects(void)
     SetPitch(fPitchShift);
     SetPhase(fPhaseShift);
   }
+
+#if SE1_VER == SE1_107 && defined(NDEBUG)
+  // 08 s3/08 s4 - store-only spatial snapshot for shadowed sounds (no COM calls;
+  // the P_UpdateSounds tail runs the driver). Called under the caller's sl_csSound.
+  DS3D_StoreSpatial(this);
+#endif
 };
 
 // 08 s3 - DirectSound3D wrapper hooks (Steam TSE 1.07 release only, 08 s1)
@@ -260,16 +266,19 @@ void (CSoundLibrary::*pDS_Mute)(void) = &CSoundLibrary::Mute;
 void (CSoundData::*pDS_ClearBuffer)(void) = &CSoundData::ClearBuffer;
 void (*pDS_MixSound)(CSoundObject *) = NULL;                               // filled with ADDR_ENGINE + 0x7AF80 at registration
 
-// 08 s3 P_MixSound (free function, SoundLibrary.h:47) - step 1-2: mode off / not yet
-// skipping, the stock mixer always runs; the bBypass skip lands in step 3
+// 08 s3 P_MixSound (free function, SoundLibrary.h:47) - step 3: shadowed entries
+// (table membership && bBypass) are skipped here (D1); everything else mixed by the
+// stock mixer. Timer thread: one table lookup + a precomputed flag read, no cvars (08 s7)
 void PDS_MixSound(CSoundObject *pso) {
+  if (DS3D_IsShadowBypassed(pso)) return;
+
   pDS_MixSound(pso);
 };
 
 // 08 s3 P_Play_internal - registration happens BEFORE the original (Play holds
 // sl_csSound, the first mix block can never see an unregistered playing sound - 07 s7.4);
 // the inlined Stop_internal inside the original never passes through P_Stop_internal
-// (05 s1.3), so re-play release + the step-2 immediate commit run after it
+// (05 s1.3), so the re-play stale-buffer release runs after it (08 s3 step 3)
 void CSoundObjDSPatch::P_Play_internal(CSoundData *pCsdLink, SLONG slFlags) {
   DS3D_OnPlayPre(this, pCsdLink, slFlags);
 
@@ -291,9 +300,13 @@ void CSoundObjDSPatch::P_dtor(void) {
   (this->*pDS_dtor)();
 };
 
-// 08 s3 P_UpdateSounds - original only in step 2; the s4 driver tail lands in step 3
+// 08 s3 P_UpdateSounds - original first (its loop calls P_Update3DEffects per object,
+// filling the shadow store); then the s4 driver tail under its own sl_csSound (the
+// original released the lock on return - SoundLibrary.cpp:1001)
 void CSoundLibDSPatch::P_UpdateSounds(void) {
   (this->*pDS_UpdateSounds)();
+
+  DS3D_DriverTail();
 };
 
 // 08 s3 P_SetFormat - step-2 interim: drop every shadow before the device is recreated

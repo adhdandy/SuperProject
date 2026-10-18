@@ -112,6 +112,13 @@ void DS3D_OnDtor(CSoundObject *pso);
 void DS3D_OnClearBuffer(CSoundData *psd);
 void DS3D_OnSetFormatPre(void);
 
+// 08 s11 step 3 - the P_MixSound skip (D1: table membership && bBypass), the spatial
+// store called from P_Update3DEffects and the per-frame driver tail called from
+// P_UpdateSounds (08 s4 steps 4-9 + one CommitDeferredSettings per frame)
+BOOL DS3D_IsShadowBypassed(CSoundObject *pso);
+void DS3D_StoreSpatial(CSoundObject *pso);
+void DS3D_DriverTail(void);
+
 // 08 s11 step 1 - declares the cvars; called from ICorePatches::SoundLibrary()
 void SoundDS3D_Init(void);
 

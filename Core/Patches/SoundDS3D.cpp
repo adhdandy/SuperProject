@@ -15,6 +15,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "StdH.h"
 #include <Engine/Base/Shell.h>
+#include <Engine/Base/Timer.h>
 #include <Engine/Sound/SoundLibrary.h>
 #include <Engine/Sound/SoundObject.h>
 #include <Engine/Sound/SoundData.h>
@@ -84,6 +85,10 @@ static BOOL _bDS3DListenerApplied = FALSE;
 
 // step-2/3 interim failure policy (the full DropToSoftware primitive lands in step 4)
 static BOOL _bDS3DCommitFailed = FALSE;
+
+// 07 s13 item 16 - high-precision timestamp of the previous driver tail (frame time
+// for the so_fDelayed advance of skipped shadows)
+static __int64 _llDS3DLastTail = 0;
 
 // 08 s3 - GUIDs. DSOUND.H / EAX.h declare them via DEFINE_GUID, which requires
 // dxguid.lib; Core does not link it, so keep local const copies (values:
@@ -356,12 +361,9 @@ static BOOL DS3D_CommitShadow(DS3DShadow *psh) {
 };
 
 // 08 s3 / 08 s6 - registration + release paths for the hook bodies in
-// Patches/SoundLibrary.cpp (step 2 scope: looping ambients only, 08 s11 step 2)
+// Patches/SoundLibrary.cpp (step 3: every eligible sound - 08 s11 step 3)
 void DS3D_OnPlayPre(CSoundObject *pso, CSoundData *psd, SLONG slFlags) {
-  // step-2 scope: looping ambients only (extended to every eligible sound in step 3)
-  const BOOL bWillShadow = DS3D_IsEligible(psd, slFlags)
-                        && ((slFlags & SOF_LOOP) != 0)
-                        && DS3D_ModeOn();
+  const BOOL bWillShadow = DS3D_IsEligible(psd, slFlags) && DS3D_ModeOn();
 
   DS3DShadow *psh = DS3D_Find(pso);
 
@@ -398,15 +400,10 @@ void DS3D_OnPlayPost(CSoundObject *pso) {
   if (psh->bReplay) {
     psh->bReplay = FALSE;
     // 08 s3 step 3 - the object was re-played: release the stale buffer (orphan
-    // play-out lands in step 5)
+    // play-out lands in step 5; the tail commits the fresh one this frame)
     DS3D_ReleaseBuffer(psh);
   }
-
-  // step-2 immediate commit for looping ambients (the lazy tail commit lands in step 3;
-  // the buffer plays audibly centered at DS defaults until the driver exists)
-  if (psh->bLooping && (pso->so_slFlags & SOF_PLAY)) {
-    if (!DS3D_CommitShadow(psh)) DS3D_CommitFailed(pso);
-  }
+  // the (re)commit itself is lazy - the DS3D_DriverTail commit (08 s4 step 3)
 };
 
 void DS3D_OnStop(CSoundObject *pso) {
@@ -456,6 +453,270 @@ void DS3D_OnSetFormatPre(void) {
   }
 
   _bDS3DListenerApplied = FALSE; // 08 s9 - re-apply on the fresh device
+};
+
+// 08 s3 / D1 - the P_MixSound membership test (timer thread, under MixSounds'
+// sl_csSound - one table lookup + the precomputed bBypass read; no cvars, 08 s7)
+BOOL DS3D_IsShadowBypassed(CSoundObject *pso) {
+  DS3DShadow *psh = DS3D_Find(pso);
+  return psh != NULL && psh->bBypass;
+};
+
+// 08 s4 (store, 07 sG10c) - compute and store the shadow's spatial values from the
+// same listener walk as the vanilla math (own loop; the [Cecil] predicted-listener
+// gate is reused so shadow and software listeners agree). Store-only: no COM calls.
+void DS3D_StoreSpatial(CSoundObject *pso) {
+  DS3DShadow *psh = DS3D_Find(pso);
+  if (psh == NULL) return;
+
+  FLOAT3D vPosition(0.0f, 0.0f, 0.0f);
+  FLOAT3D vSpeed(0.0f, 0.0f, 0.0f);
+
+  if (pso->so_penEntity != NULL) {
+    vPosition = pso->so_penEntity->en_plPlacement.pl_PositionVector;
+
+    if (pso->so_penEntity->en_ulPhysicsFlags & EPF_MOVABLE) {
+      CMovableEntity *penMovable = (CMovableEntity *)pso->so_penEntity;
+      vSpeed = penMovable->en_vCurrentTranslationAbsolute;
+    }
+  }
+
+  // accumulators (02 s2): weighted sums over contributors
+  FLOAT fSum = 0.0f;
+  FLOAT3D vPosAcc(0.0f, 0.0f, 0.0f);
+  FLOAT3D vVelAcc(0.0f, 0.0f, 0.0f);
+  FLOAT fVolAcc = 0.0f;
+  FLOAT fFilterAcc = 0.0f;
+
+  if (pso->so_penEntity != NULL) {
+    const BOOL bVolumetric = ((pso->so_slFlags & SOF_VOLUMETRIC) != 0) || (pso->so_psdcDecoder != NULL);
+    // 07 s14.3 item 2: the beta's mask 0x58 = LOCAL|MUSIC|VOICE; Steam has no voice
+    // flag, so the mapping is LOCAL|MUSIC = 0x50
+    const BOOL bNoFilter = (pso->so_slFlags & (SOF_LOCAL|SOF_MUSIC)) != 0;
+
+    FOREACHINLIST(CSoundListener, sli_lnInActiveListeners, _pSound->sl_lhActiveListeners, itsli) {
+      CSoundListener &sli = *itsli;
+
+      // [Cecil] gate - same listener set as the vanilla math (07 sG10c)
+      if (pso->so_slFlags & SOF_LOCAL) {
+        if (sli.sli_penEntity == NULL) continue;
+        if (pso->so_penEntity != sli.sli_penEntity->GetPredictionTail()) continue;
+      }
+
+      FLOAT3D vAbsDelta = vPosition - sli.sli_vPosition;
+      FLOAT fAbsDelta = vAbsDelta.Length();
+
+      if (fAbsDelta > pso->so_sp3.sp3_fFalloff) continue; // 02 s2 - no contribution at all
+
+      // distance factor w and volumetric bias (02 s2/s3, 99 #2/#5)
+      FLOAT fW = 1.0f;
+      FLOAT fVolBias = 0.0f;
+
+      if (fAbsDelta > pso->so_sp3.sp3_fHotSpot) {
+        fW = (pso->so_sp3.sp3_fFalloff - fAbsDelta)
+           / (pso->so_sp3.sp3_fFalloff - pso->so_sp3.sp3_fHotSpot);
+        fVolBias = ClampUp((fAbsDelta - pso->so_sp3.sp3_fHotSpot)
+                         / (pso->so_sp3.sp3_fFalloff - pso->so_sp3.sp3_fHotSpot) * 3.0f, 1.0f);
+      }
+
+      // rotated delta and relative velocity in listener space (02 s2/s5, engine z)
+      FLOAT3D vDirR = vAbsDelta * !sli.sli_mRotation;
+      FLOAT3D vVelR = (vSpeed - sli.sli_vSpeed) * !sli.sli_mRotation;
+
+      // volumetric near-field blend (02 s3): bias 0 -> pinned in front, static;
+      // 0 < bias < 1 -> axis-lerp rotation of the front basis; bias >= 1 -> plain
+      if (bVolumetric) {
+        if (fVolBias <= 0.0f) {
+          vDirR = FLOAT3D(0.0f, 0.0f, -1.0f);
+          vVelR = FLOAT3D(0.0f, 0.0f, 0.0f);
+
+        } else if (fVolBias < 1.0f && fAbsDelta > 0.001f) {
+          const FLOAT3D vFront(0.0f, 0.0f, -1.0f);
+          FLOAT3D vN = vDirR / fAbsDelta;
+          FLOAT fDot = -vN(3); // dot(n, front) - 99 #5 / 07 s14.4 (ACos(n.z) is a misread)
+
+          FLOAT3D vPlane = vN * vFront; // rotation axis in the horizontal plane
+          FLOAT fPlaneLen = vPlane.Length();
+          if (fPlaneLen > 0.001f) {
+            vPlane /= fPlaneLen;
+          } else {
+            vPlane = FLOAT3D(0.0f, 1.0f, 0.0f); // exactly front/back - any vertical axis
+          }
+
+          FLOAT3D vOrt2 = vFront * vPlane;
+          FLOAT fT = Clamp(fDot, 0.0f, 1.0f); // lerp toward +Y for downward directions
+          FLOAT3D vOrt1 = vOrt2 * (1.0f - fT) + FLOAT3D(0.0f, 1.0f, 0.0f) * fT;
+
+          FLOAT fAngle = (FLOAT)acos((double)Clamp(fDot, -1.0f, 1.0f)) * fVolBias;
+          vDirR = vFront * (FLOAT)cos((double)fAngle) + vOrt1 * (FLOAT)sin((double)fAngle);
+          vVelR *= fVolBias; // attenuated speed
+        }
+      }
+
+      fSum += fW;
+      vPosAcc += vDirR * fW;
+      vVelAcc += vVelR * fW;
+      fVolAcc += sli.sli_fVolume * pso->so_sp3.sp3_fMaxVolume * fW * fW;
+      fFilterAcc += (bNoFilter ? 0.0f : sli.sli_fFilter) * fW;
+    }
+  }
+
+  if (fSum > 0.001f) {
+    psh->vPos = vPosAcc / fSum;                          // 02 s2 - weighted average
+    psh->vVel = vVelAcc / fSum;                          // 02 s5
+    psh->fLastVolume = Clamp(fVolAcc / fSum, 0.0f, 1.0f); // 08 s4, G10c - clamp01, pre-master
+    psh->fLastFilter = fFilterAcc / fSum;                // 99 #13 DirectHF source
+    // 07 s13 item 16 - sp_new delay test in the store; the tail advances so_fDelayed
+    psh->bDelayPending = (pso->so_spNew.sp_fDelay > 0.0f && pso->so_fDelayed < pso->so_spNew.sp_fDelay);
+
+  } else {
+    // parked (02 s1/08 s4): no entity or no listener within falloff
+    psh->vPos = FLOAT3D(0.0f, 0.0f, 10000.0f);
+    psh->vVel = FLOAT3D(0.0f, 0.0f, 0.0f);
+    psh->fLastVolume = 0.0f;
+    psh->fLastFilter = 0.0f;
+    psh->bDelayPending = FALSE;
+  }
+
+  psh->bSpatialValid = TRUE; // 07 s13 item 18 - store ran; the driver's Play may follow
+};
+
+// 08 s4 steps 4-9 - drive one committed shadow (step-3 subset: no mute/pause gates,
+// no budgets, no D8 silence gate - steps 4/5)
+static void DS3D_DriveShadow(DS3DShadow *psh) {
+  CSoundObject *pso = psh->psoOwner;
+  LPDIRECTSOUNDBUFFER pbuf = psh->pBuffer;
+
+  // 4. position/velocity - DEFERRED (99 #6), z-negated into DS3D space (02 s5)
+  psh->pBuffer3D->SetPosition(psh->vPos(1), psh->vPos(2), -psh->vPos(3), DS3D_DEFERRED);
+  psh->pBuffer3D->SetVelocity(psh->vVel(1), psh->vVel(2), -psh->vVel(3), DS3D_DEFERRED);
+
+  // 5. current status (used by the finish rule and the EAX gate)
+  DWORD dwStatus = 0;
+  if (FAILED(pbuf->GetStatus(&dwStatus))) dwStatus = 0;
+  BOOL bPlaying = (dwStatus & DSBSTATUS_PLAYING) != 0;
+
+  // 6. volume + frequency - IMMEDIATE (99 #6); the mute/pause gate skipping of the
+  // sets lands in step 4
+  static CSymbolPtr pfSoundVolume("snd_fSoundVolume");
+  FLOAT fVol = psh->fLastVolume * pfSoundVolume.GetFloat(); // master factor (07 sG10b)
+
+  SLONG slCb;
+  if (fVol <= 0.005f) {
+    slCb = DSBVOLUME_MIN; // 99 #10
+  } else {
+    if (fVol > 1.0f) fVol = 1.0f; // log10 input guard (DS range is [-10000, 0])
+    FLOAT fCb = 3000.0f * (fVol * (fVol - 1.0f) + (1.0f - fVol) * (FLOAT)log10((double)fVol));
+    slCb = (SLONG)Clamp((LONG)FloatToInt(fCb), (LONG)DSBVOLUME_MIN, (LONG)0);
+  }
+  pbuf->SetVolume(slCb);
+
+  const FLOAT fPitch = pso->so_sp3.sp3_fPitch;
+  const SLONG slFreq = (fPitch == 1.0f) ? 0 : FloatToInt(psh->iRate * fPitch); // 99 #11
+  pbuf->SetFrequency(slFreq);
+
+  // 7. Play (resume) once the store ran and the delay elapsed (07 s13 items 16/18)
+  if (!bPlaying && !psh->bDelayPending && psh->bSpatialValid && !psh->bStarted) {
+    if (SUCCEEDED(pbuf->Play(0, 0, psh->bLooping ? DSBPLAY_LOOPING : 0))) {
+      psh->bStarted = TRUE;
+      bPlaying = TRUE; // just started - the finish rule may not fire on this frame
+    }
+  }
+
+  // 8. finish (pure beta rule, 08 s4 step 8; the no-gates condition joins with the
+  // step-4 gates) - a started non-looping shadow that DS reports not playing has
+  // finished naturally (or the device stopped it). SOF_PLAY is ours to clear, under
+  // sl_csSound; the engine unlinks the object on the next UpdateSounds (line 1067-1070).
+  if (psh->bStarted && !bPlaying && !psh->bLooping) {
+    psh->bStarted = FALSE;
+    pso->so_slFlags &= ~SOF_PLAY;
+    pso->so_fDelayed = 0.0f; // mixer parity (07 s13 item 16)
+    return;                  // the tail drops the entry (buffer release)
+  }
+
+  // 9. EAX DirectHF (DEFERRED) - 99 #13
+  if (psh->pKsProps != NULL && _snd_bUseEnvironmentFX != 0
+   && (pso->so_slFlags & SOF_3D) && bPlaying) {
+    LONG lHF = FloatToInt(-100.0f * psh->fLastFilter - 0.5f); // round() for negatives
+    lHF = Clamp(lHF, (LONG)-10000, (LONG)0);
+    psh->pKsProps->Set(_guidEAXBufferProps,
+      0x80000003 /* DEFERRED | DSPROPERTY_EAXBUFFER_DIRECTHF, EAX.h:254 */,
+      NULL, 0, &lHF, sizeof(LONG));
+  }
+};
+
+// 08 s4 - the per-frame driver tail, called after the original UpdateSounds (which
+// released sl_csSound on return, SoundLibrary.cpp:1001): table validation, delay
+// advance, lazy commit and driver steps 4-9 per shadow, then ONE CommitDeferredSettings
+void DS3D_DriverTail(void) {
+  if (_mapShadows.size() == 0) return; // fast path: mode off / nothing registered
+  if (_pSound == NULL || _pSound->sl_pDS == NULL || _pSound->sl_pDSListener == NULL) return;
+
+  CTSingleLock slSounds(&_pSound->sl_csSound, TRUE); // OPTEX-recursive (08 s7)
+
+  // frame time for the so_fDelayed advance (07 s13 item 16); clamped, first call safe
+  CTimerValue tvNow = _pTimer->GetHighPrecisionTimer();
+  CTimerValue tvLast(_llDS3DLastTail);
+  _llDS3DLastTail = tvNow.tv_llValue;
+  FLOAT fFrameSecs = Clamp((FLOAT)(tvNow - tvLast).GetSeconds(), 0.0f, 0.25f);
+
+  BOOL bAnyBuffer = FALSE;
+
+  se1::map<CSoundObject *, DS3DShadow *>::iterator it = _mapShadows.begin();
+  while (it != _mapShadows.end()) {
+    CSoundObject *pso = it->first;
+    DS3DShadow *psh = it->second;
+
+    // validation: !SOF_PLAY means the engine is done with the sound (Stop clears it,
+    // the stock mixer clears it for fallback entries - none exist in step 3)
+    if (!(pso->so_slFlags & SOF_PLAY)) {
+      DS3D_ReleaseBuffer(psh);
+      delete psh;
+      it = _mapShadows.erase(it);
+      continue;
+    }
+
+    // 07 s13 item 17 - refresh the cached format from the live data AFTER the check
+    // above; psdKey stays an opaque key and is never dereferenced
+    CSoundData *psd = pso->so_pCsdLink;
+    if (psd != NULL) {
+      psh->psdKey = psd;
+      psh->iRate = psd->sd_wfeFormat.nSamplesPerSec;
+      psh->iChannels = psd->sd_wfeFormat.nChannels;
+      psh->iBytesPerFrame = psh->iChannels * (psd->sd_wfeFormat.wBitsPerSample / 8);
+    }
+
+    // delay advance for pending skipped shadows - the stock mixer no longer advances
+    // them (07 s13 item 16: advances only while bDelayPending && bBypass)
+    if (psh->bDelayPending && psh->bBypass) {
+      pso->so_fDelayed += fFrameSecs;
+      psh->bDelayPending = (pso->so_sp.sp_fDelay > 0.0f && pso->so_fDelayed < pso->so_sp.sp_fDelay);
+    }
+
+    // 08 s4 step 3 - lazy commit (step-3: no silence gate / budget - steps 4/5)
+    if (psh->pBuffer == NULL) {
+      if (!DS3D_CommitShadow(psh)) {
+        DS3D_CommitFailed(pso); // interim: drop the entry (DropToSoftware in step 4)
+        it = _mapShadows.begin(); // the map was mutated; restart (se1::map erase-safe)
+        continue;
+      }
+    }
+
+    DS3D_DriveShadow(psh);
+    bAnyBuffer = TRUE;
+
+    if (!(pso->so_slFlags & SOF_PLAY)) {
+      // finish rule fired (step 8) - release and drop
+      DS3D_ReleaseBuffer(psh);
+      delete psh;
+      it = _mapShadows.erase(it);
+      continue;
+    }
+    it++;
+  }
+
+  // 99 #6 - one commit per frame, on the listener (the DS object that owns it)
+  if (bAnyBuffer) _pSound->sl_pDSListener->CommitDeferredSettings();
 };
 
 #endif // _PATCHCONFIG_ENGINEPATCHES && SE1_VER == SE1_107 && defined(NDEBUG)
