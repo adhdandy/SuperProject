@@ -13,6 +13,22 @@ Per the SE1-ModSDK wiki (`DreamyCecil/SE1-ModSDK`, page *Building*):
 4. Optional: a newer Visual Studio for the IDE (the script uses MSBuild 4.0).
 5. Submodules: `git submodule update --init --recursive` (API, Includes, Extras\XGizmo).
 
+### Toolchain locations (installed state, validated)
+| Piece | Location |
+|---|---|
+| MSVC 6.0 SP6 (the `v60` compiler) | `E:\Program Files (x86)\Microsoft Visual Studio\VC98` (`cl.exe` 12.00.8804.0) |
+| VS2010 Professional | `E:\Program Files (x86)\Microsoft Visual Studio 10.0` (not under `C:\`) |
+| Daffodil R2.6.6 `v60` toolset | `C:\Program Files (x86)\MSBuild\Microsoft.Cpp\v4.0\Platforms\Win32\PlatformToolsets\v60` |
+| MSBuild 4.0 | `%WINDIR%\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe` |
+
+Discovery rules (`build.ps1` prints the resolved paths before building):
+- **VS2010**: `HKLM\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\10.0@InstallDir`,
+  then the Programs-and-Features `InstallLocation`, then the default
+  `%ProgramFiles(x86)%\Microsoft Visual Studio 10.0` path.
+- **VC6**: the `v60` toolset reads
+  `HKLM\SOFTWARE\WOW6432Node\Microsoft\DevStudio\6.0\Products\Microsoft Visual C++@ProductDir`
+  (must point at the `VC98` directory) — keep that key valid if VC6 is reinstalled.
+
 The per-project `Release_TSE107` configurations already select `PlatformToolset`
 `v60`; **do not** override the toolset on the command line.
 
@@ -20,8 +36,10 @@ The per-project `Release_TSE107` configurations already select `PlatformToolset`
     MSBuild SamClassicPatch.sln /nologo /m /p:Configuration=Release_TSE107 /p:Platform=x86
 
 `build.ps1` locates MSBuild 4.0 (`%WINDIR%\Microsoft.NET\Framework\v4.0.30319`),
-verifies VS2010 + the Daffodil `v60` toolset are installed, and throws a precise
-prerequisite list if any is missing.
+resolves VS2010/VC6 via the registry rules above, verifies the Daffodil `v60`
+toolset is installed, prints the resolved toolchain paths, and throws a precise
+prerequisite list if any piece is missing (including VC6, which the `v60`
+toolset itself only finds through the DevStudio registry key).
 
 ## Usage
     .\build.ps1                 # full solution -> build.log

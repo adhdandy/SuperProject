@@ -41,8 +41,11 @@ if ([string]::IsNullOrEmpty($DeployTo)) { $DeployTo = Join-Path $root 'deploy\Bi
 Write-Host "== build.ps1  Config=$Config  Platform=$Platform  Deploy=$([bool]$Deploy) =="
 
 # ── 1. Locate the native (v60) toolchain ─────────────────────────────────────
+# Non-default install locations on this machine:
+#   VC6 SP6 : E:\Program Files (x86)\Microsoft Visual Studio\VC98  (registry-resolved)
+#   VS2010  : E:\Program Files (x86)\Microsoft Visual Studio 10.0  (registry-resolved)
+#   Daffodil: C:\Program Files (x86)\MSBuild\Microsoft.Cpp\v4.0\Platforms\Win32\PlatformToolsets\v60
 $pf86      = ${env:ProgramFiles(x86)}
-$vs10Dir   = Join-Path $pf86 'Microsoft Visual Studio 10.0'
 $msbuild4  = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\MSBuild.exe'
 $vctargets = Join-Path $pf86 'MSBuild\Microsoft.Cpp\v4.0'
 $v60props  = Join-Path $vctargets 'Platforms\Win32\PlatformToolsets\v60\Microsoft.Cpp.Win32.v60.props'
@@ -52,8 +55,36 @@ $prereqs = "Native v60 build prerequisites (per SE1-ModSDK wiki 'Building'):`n" 
            "  2. Visual Studio 2010 (Visual C++ installed);`n" +
            "  3. Daffodil (manusoft-daffodil R2.6.6) which adds the 'v60' toolset to VS2010."
 
+# VS2010 may live outside %ProgramFiles(x86)%: try the VS registry InstallDir
+# (strip the trailing Common7\IDE), then Programs-and-Features InstallLocation,
+# then the default path.
+function Get-VS2010Dir {
+    $ide = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\10.0' -ErrorAction SilentlyContinue).InstallDir
+    if ($ide) { return (Split-Path -Path (Split-Path -Path $ide.TrimEnd('\') -Parent) -Parent) }
+    $uninstall = Get-ChildItem 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue } |
+        Where-Object { $_.DisplayName -like '*Visual Studio 2010*' -and $_.InstallLocation } |
+        Select-Object -First 1
+    if ($uninstall) { return $uninstall.InstallLocation.TrimEnd('\') }
+    return (Join-Path $pf86 'Microsoft Visual Studio 10.0')
+}
+
+# The Daffodil 'v60' toolset resolves the VC6 compiler from this registry value
+# (see Microsoft.Cpp.Win32.v60.props), so the build follows the same source.
+function Get-VC6Dir {
+    foreach ($k in @('HKLM:\SOFTWARE\Wow6432Node\Microsoft\DevStudio\6.0\Products\Microsoft Visual C++',
+                     'HKLM:\SOFTWARE\Microsoft\DevStudio\6.0\Products\Microsoft Visual C++')) {
+        $d = (Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue).ProductDir
+        if ($d) { return $d.TrimEnd('\') }
+    }
+    return ''
+}
+
+$vs10Dir = Get-VS2010Dir
+$vc6Dir  = Get-VC6Dir
+
 if (-not (Test-Path -LiteralPath $vs10Dir)) {
-    throw "Visual Studio 2010 not found at '$vs10Dir'.`n$prereqs"
+    throw "Visual Studio 2010 not found (resolved '$vs10Dir').`n$prereqs"
 }
 if (-not (Test-Path -LiteralPath $vctargets)) {
     throw "VC build targets not found at '$vctargets'. Install Visual Studio 2010 with Visual C++.`n$prereqs"
@@ -64,7 +95,16 @@ if (-not (Test-Path -LiteralPath $v60props)) {
 if (-not (Test-Path -LiteralPath $msbuild4)) {
     throw "MSBuild 4.0 not found at '$msbuild4'. Install Visual Studio 2010.`n$prereqs"
 }
-Write-Host "MSBuild: $msbuild4  (toolset v60 via Daffodil)"
+if (-not $vc6Dir -or -not (Test-Path -LiteralPath (Join-Path $vc6Dir 'BIN\cl.exe'))) {
+    throw "Visual C++ 6.0 not found (resolved '$vc6Dir'). The Daffodil 'v60' toolset reads`n" +
+          "HKLM\SOFTWARE\Wow6432Node\Microsoft\DevStudio\6.0\Products\Microsoft Visual C++@ProductDir;`n" +
+          "install VC6 + SP6 so that key points at a VC98 directory.`n$prereqs"
+}
+Write-Host "Toolchain (native v60):"
+Write-Host "  MSBuild 4.0 : $msbuild4"
+Write-Host "  VS2010      : $vs10Dir"
+Write-Host "  VC6 SP6     : $vc6Dir"
+Write-Host "  Daffodil    : $v60props"
 
 # ── 2. Warn if a required submodule is empty ─────────────────────────────────
 foreach ($sub in 'API', 'Includes', 'Extras\XGizmo') {
@@ -97,35 +137,68 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $code = $LASTEXITCODE
 $sw.Stop()
 
-# ── 5. Parse the log: error lines + per-project pass/fail ────────────────────
-$errPattern  = '(?i):\s*fatal error\b|:\s*error\s+[A-Z]|^\s*error\b|error MSB\d+|treated as error'
-$projStart   = 'Project "([^"]+\.(?:vcxproj|csproj|sln))"\s+on node'
-$projOutRe   = '->\s*([^\s]+\.(?:dll|exe|lib|pdb))\b'
+# ── 5. Parse the log: errors + per-project pass/fail (locale-neutral) ────────
+# MSBuild/VS output is localized, so only locale-neutral tokens are parsed:
+#   * diagnostics always contain ": error"/"error MSB" and a source file path
+#   * target lines look like "<name>.vcxproj -> <output>"
+$errPattern   = '(?i):\s*fatal error\b|:\s*error\s+[A-Z]|\berror\s+MSB\d+|treated as error'
+$diagPathRe   = '([A-Za-z]:\\[^(]+?)\(\d+(?:,\d+)?\)\s*:'
+$targetLineRe = '([\w\.\-]+\.vcxproj)\s*->\s*(\S+\.(?:dll|exe|lib))\b'
+
+# Project name/directory from the solution; longest directory first so error
+# attribution uses the deepest matching project.
+$projDirs = @()
+foreach ($line in (Get-Content -LiteralPath $sln -ErrorAction SilentlyContinue)) {
+    if ($line -match '^Project\("[^"]+"\)\s*=\s*"([^"]+)"\s*,\s*"([^"]+\.vcxproj)"') {
+        $projDirs += [pscustomobject]@{
+            File = [System.IO.Path]::GetFileName($Matches[2])
+            Dir  = Split-Path -Path (Join-Path $repo $Matches[2]) -Parent
+        }
+    }
+}
+$projDirs = @($projDirs | Sort-Object { $_.Dir.Length } -Descending)
 
 $log         = @(Get-Content -LiteralPath $logPath -ErrorAction SilentlyContinue)
 $errLines    = @()
 $projErrors  = @{}
 $projOutput  = @{}
-$current     = '(solution)'
 
 foreach ($line in $log) {
-    if ($line -match $projStart) { $current = [System.IO.Path]::GetFileName($Matches[1]) }
     if ($line -match $errPattern) {
         $errLines += $line
-        if ($current) { $projErrors[$current] = 1 + [int]($projErrors[$current]) }
+        $owner = '(unattributed)'
+        if ($line -match $diagPathRe) {
+            $file = $Matches[1].Trim()
+            foreach ($p in $projDirs) {
+                if ($file.StartsWith($p.Dir, [System.StringComparison]::OrdinalIgnoreCase)) { $owner = $p.File; break }
+            }
+        }
+        $projErrors[$owner] = 1 + [int]($projErrors[$owner])
+    } elseif ($line -match $targetLineRe) {
+        $projOutput[$Matches[1]] = $Matches[2]
     }
-    if ($line -match $projOutRe -and $current) { $projOutput[$current] = $Matches[1] }
 }
 
-if ($projErrors.Count -gt 0 -or $projOutput.Count -gt 0) {
-    $names = @($projErrors.Keys + $projOutput.Keys | Sort-Object -Unique)
-    Write-Host ""
-    Write-Host "--- per-project result ---"
-    foreach ($n in $names) {
-        $e = [int]($projErrors[$n]); $o = $projOutput[$n]
-        $verdict = if ($e -gt 0) { 'FAIL' } else { 'PASS' }
-        Write-Host ("  {0,-6} {1}{2}" -f $verdict, $n, $(if ($o) { "  -> $o" } else { "" }))
+$builtCount = 0; $skipCount = 0
+Write-Host ""
+Write-Host "--- per-project result ---"
+foreach ($p in $projDirs) {
+    $e = [int]($projErrors[$p.File]); $o = $projOutput[$p.File]
+    if ($e -gt 0) {
+        Write-Host ("  FAIL   {0}  ({1} error line(s))" -f $p.File, $e)
+        $builtCount++
+    } elseif ($o) {
+        Write-Host ("  PASS   {0}  -> {1}" -f $p.File, (Split-Path -Leaf $o))
+        $builtCount++
+    } else {
+        $skipCount++
     }
+}
+if ($projErrors.ContainsKey('(unattributed)')) {
+    Write-Host ("  FAIL   (unattributed)  ({0} error line(s))" -f $projErrors['(unattributed)'])
+}
+if ($skipCount -gt 0) {
+    Write-Host ("  ...    $skipCount project(s) not built in this configuration")
 }
 
 if ($errLines.Count -gt 0) {
