@@ -42,8 +42,8 @@ INDEX _snd_bUseEnvironmentFX = 1;
 
 // 07 s16 - post-curve flat gain offset in dB (deviation from beta parity; applied after
 // the 99 #10 curve at 08 s4 step 6, ungated branch only). Clamped -30..0 at read time.
-// Default -9.0 (user-tuned, finalized 2026-10-18; -4.0 was the provisional first cut).
-FLOAT _snd_fDS3DGain = -9.0f;
+// Default -6.0 (user-tuned, finalized 2026-10-18; -4.0 and -9.0 were earlier cuts).
+FLOAT _snd_fDS3DGain = -6.0f;
 
 // 08 s6 - refusal state. Cleared if any hook in ICorePatches::SoundLibrary() fails its
 // install check (dtor symbol missing, MixSound prologue/module mismatch). Step 3
