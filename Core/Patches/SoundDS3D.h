@@ -97,7 +97,7 @@ struct DS3DShadow {
   INDEX iRate;                   // cached from the play args (08 s8, 99 #11)
   INDEX iChannels;
   INDEX iBytesPerFrame;
-  INDEX iFailFrames;             // step-4 failure policy
+  INDEX iFailFrames;             // G9.3 lost-buffer Restore-once tracker
   DOUBLE tmSilentSince;          // step-5 D8 silent-since timer (07 s13 item 24)
 };
 
@@ -111,6 +111,11 @@ void DS3D_OnStop(CSoundObject *pso);
 void DS3D_OnDtor(CSoundObject *pso);
 void DS3D_OnClearBuffer(CSoundData *psd);
 void DS3D_OnSetFormatPre(void);
+void DS3D_OnSetFormatPost(void); // 08 s3 G6 - listener re-apply or forced disable
+
+// 08 s11 step 4 - the Mute window hook body (P_Mute original first, then Stop every
+// playing shadow + bGateStopped; buffers kept - 07 sG7 companion)
+void DS3D_OnMute(void);
 
 // 08 s11 step 3 - the P_MixSound skip (D1: table membership && bBypass), the spatial
 // store called from P_Update3DEffects and the per-frame driver tail called from

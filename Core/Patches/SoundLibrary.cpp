@@ -309,17 +309,22 @@ void CSoundLibDSPatch::P_UpdateSounds(void) {
   DS3D_DriverTail();
 };
 
-// 08 s3 P_SetFormat - step-2 interim: drop every shadow before the device is recreated
-// (software takes over; ReleaseForRecommit + recommit-at-synced-offset lands in step 4/6),
-// the listener parameters re-apply on the fresh device at the next registration (08 s9)
+// 08 s3 P_SetFormat - pre: free templates + release ALL shadows via ReleaseForRecommit
+// (entries kept); post: re-apply the beta listener params on the fresh device (the next
+// P_UpdateSounds tail recommits at the synced offsets - RECREATE, 07 s13 item 15) or,
+// when the listener is gone, DropToSoftware all + forced mode disable (08 s11 step 4)
 CSoundLibrary::SoundFormat CSoundLibDSPatch::P_SetFormat(CSoundLibrary::SoundFormat EsfNew, BOOL bReload) {
   DS3D_OnSetFormatPre();
-  return (this->*pDS_SetFormat)(EsfNew, bReload);
+  CSoundLibrary::SoundFormat EsfRet = (this->*pDS_SetFormat)(EsfNew, bReload);
+  DS3D_OnSetFormatPost();
+  return EsfRet;
 };
 
-// 08 s3 P_Mute - passthrough until the shadow gate-stop lands in step 5
+// 08 s3 P_Mute - original (zeroes mix buffers, sets _bMuted); then Stop every playing
+// shadow + bGateStopped, buffers kept (07 sG7 companion - resume from the DS position)
 void CSoundLibDSPatch::P_Mute(void) {
   (this->*pDS_Mute)();
+  DS3D_OnMute();
 };
 
 // 08 s3 P_ClearBuffer - invalidate the cached template (07 sG1 single invalidation point)
