@@ -80,6 +80,12 @@ BOOL SoundDS3D_CheckMixSound(void) {
 static se1::map<CSoundObject *, DS3DShadow *> _mapShadows;
 static se1::map<CSoundData *, DS3DTemplate> _mapTemplates;
 
+// 99 #9 - same-sounds budget (07 s13 item 26): per-frame running sums of the
+// master-scaled volumes, keyed by the opaque psdKey (item 12), reset every driver
+// tail; over-budget entries stay committed at volume 0 (beta parity - deliberately
+// NOT routed through the D8 silence gate)
+static se1::map<CSoundData *, FLOAT> _mapSameRunning;
+
 // 08 s9 - listener parameters applied once per (re)initialized device
 static BOOL _bDS3DListenerApplied = FALSE;
 
@@ -104,6 +110,10 @@ static void DS3D_NoticeOnce(BOOL &bFlag, const char *strMsg) {
 // 07 s13 item 16 - high-precision timestamp of the previous driver tail (frame time
 // for the so_fDelayed advance of skipped shadows)
 static __int64 _llDS3DLastTail = 0;
+
+// 07 s13 item 28 - game tick of the previous driver tail (the D8 silent-since timer
+// advances on the game clock for game sounds: frozen while the game does not tick)
+static TIME _fDS3DLastTick = 0.0f;
 
 // 08 s3 - GUIDs. DSOUND.H / EAX.h declare them via DEFINE_GUID, which requires
 // dxguid.lib; Core does not link it, so keep local const copies (values:
@@ -160,8 +170,8 @@ static void DS3D_ApplyListenerParams(void) {
   CPrintF("DS3D: snd_bDS3DSpatial active - listener parameters applied\n");
 };
 
-// 08 s8 - release the shadow's DS objects (force; the orphan play-out list lands in
-// step 5, so the buffer is stopped now). Idempotent; failure of Stop is ignorable.
+// 08 s8 - release the shadow's DS objects (force stop + release). Idempotent;
+// failure of Stop is ignorable. The non-forced orphan path is DS3D_DetachToOrphan.
 static void DS3D_ReleaseBuffer(DS3DShadow *psh) {
   if (psh->pKsProps != NULL)  { psh->pKsProps->Release();  psh->pKsProps = NULL; }
   if (psh->pBuffer3D != NULL) { psh->pBuffer3D->Release(); psh->pBuffer3D = NULL; }
@@ -173,8 +183,79 @@ static void DS3D_ReleaseBuffer(DS3DShadow *psh) {
   psh->bStarted = FALSE;
 };
 
+// 08 s8 - orphan entry: interfaces detached from a removed/re-played shadow. No
+// CSoundData*/owner pointer (never dereferenced); the buffer plays out (99 #17
+// non-forced, beta FUN_10082780 semantics) and the per-frame scan releases it once done
+struct DS3DOrphan {
+  LPDIRECTSOUNDBUFFER pBuffer;
+  LPDIRECTSOUND3DBUFFER pBuffer3D;
+  LPKSPROPERTYSET pKsProps;
+};
+static std::list<DS3DOrphan> _lstOrphans;
+
+static void DS3D_ReleaseOrphan(DS3DOrphan &orph) {
+  if (orph.pKsProps != NULL)  { orph.pKsProps->Release();  orph.pKsProps = NULL; }
+  if (orph.pBuffer3D != NULL) { orph.pBuffer3D->Release(); orph.pBuffer3D = NULL; }
+  if (orph.pBuffer != NULL) {
+    orph.pBuffer->Stop(); // ignorable - already stopped counts as fine
+    orph.pBuffer->Release();
+    orph.pBuffer = NULL;
+  }
+};
+
+// 99 #17 / 08 s3 - detach a live buffer to the orphan list instead of force-stopping
+// it (re-play in P_Play_internal, explicit Stop_internal): it plays out and the tail
+// scan releases it later. A buffer that is not actually playing is plain-released
+// right away (beta 0x82780: GetStatus; not playing -> release now). Looping buffers are
+// force-released: the buffer carries DSBPLAY_LOOPING, so "playing out" would never end
+// - the scan would never release it (07 s15: deliberate deviation, stop means stop).
+// bWasLooping is passed separately: on a re-play, bLooping already holds the NEW play's
+// flag (OnPlayPre snapshots the old one into bReplayLooping).
+static void DS3D_DetachToOrphan(DS3DShadow *psh, BOOL bWasLooping) {
+  if (psh->pBuffer == NULL) return;
+
+  DWORD dwStatus = 0;
+  const BOOL bPlaying = SUCCEEDED(psh->pBuffer->GetStatus(&dwStatus))
+                     && (dwStatus & DSBSTATUS_PLAYING) != 0;
+
+  if (!bPlaying || bWasLooping) {
+    DS3D_ReleaseBuffer(psh);
+    return;
+  }
+
+  DS3DOrphan orph;
+  orph.pBuffer = psh->pBuffer;
+  orph.pBuffer3D = psh->pBuffer3D;
+  orph.pKsProps = psh->pKsProps;
+  _lstOrphans.push_back(orph);
+
+  psh->pBuffer = NULL;
+  psh->pBuffer3D = NULL;
+  psh->pKsProps = NULL;
+  psh->bStarted = FALSE;
+};
+
+// 08 s8 - orphan scan: release entries whose buffer is done (GetStatus failed or not
+// playing). Runs every driver tail under sl_csSound; the SetFormat pre-pass frees the
+// whole list while the device is still alive (08 s3 - "mark generation", 07 sG6)
+static void DS3D_ScanOrphans(void) {
+  std::list<DS3DOrphan>::iterator it = _lstOrphans.begin();
+
+  while (it != _lstOrphans.end()) {
+    DWORD dwStatus = 0;
+
+    if (FAILED(it->pBuffer->GetStatus(&dwStatus)) || !(dwStatus & DSBSTATUS_PLAYING)) {
+      DS3D_ReleaseOrphan(*it);
+      it = _lstOrphans.erase(it);
+    } else {
+      it++;
+    }
+  }
+};
+
 // 08 s8 - registry entry removal (release + erase). Game thread, under sl_csSound.
-// Plain release (no position sync): Stop_internal/dtor, driver finish, !SOF_PLAY drops.
+// Plain release (no position sync): dtor, driver finish, !SOF_PLAY drops; the
+// explicit Stop_internal path detaches the buffer to the orphan list first (99 #17)
 static void DS3D_RemoveEntry(CSoundObject *pso) {
   se1::map<CSoundObject *, DS3DShadow *>::iterator it = _mapShadows.find(pso);
   if (it == _mapShadows.end()) return;
@@ -241,6 +322,7 @@ static DS3DShadow *DS3D_NewShadow(CSoundObject *pso) {
   psh->bBypass = TRUE;         // 07 s13 item 19: true at registration
   psh->bGateStopped = FALSE;
   psh->bReplay = FALSE;
+  psh->bReplayLooping = FALSE;
   psh->vPos = FLOAT3D(0.0f, 0.0f, 10000.0f);
   psh->vVel = FLOAT3D(0.0f, 0.0f, 0.0f);
   psh->fLastVolume = 0.0f;
@@ -427,8 +509,11 @@ void DS3D_OnPlayPre(CSoundObject *pso, CSoundData *psd, SLONG slFlags) {
     DS3D_ApplyListenerParams(); // 08 s9 - first registration enables the mode
   } else {
     // re-play: the original's inlined Stop_internal won't pass through P_Stop_internal
-    // (05 s1.3) - release the stale buffer right after it (DS3D_OnPlayPost)
+    // (05 s1.3) - release the stale buffer right after it (DS3D_OnPlayPost). Snapshot
+    // the OLD loop state first: the registration block below overwrites bLooping with
+    // the new play's, and the detach decision needs the old buffer's (07 s15)
     psh->bReplay = TRUE;
+    psh->bReplayLooping = psh->bLooping;
   }
 
   // (re)play registration - key + cached fields from the play arguments (08 s8)
@@ -437,7 +522,9 @@ void DS3D_OnPlayPre(CSoundObject *pso, CSoundData *psd, SLONG slFlags) {
   psh->iRate = psd->sd_wfeFormat.nSamplesPerSec;
   psh->iChannels = psd->sd_wfeFormat.nChannels;
   psh->iBytesPerFrame = psh->iChannels * (psd->sd_wfeFormat.wBitsPerSample / 8);
-  psh->bSpatialValid = FALSE; // 07 s13 item 18 - a fresh store gates the Play
+  psh->bSpatialValid = FALSE;  // 07 s13 item 18 - a fresh store gates the Play
+  psh->tmSilentSince = 0.0;    // 07 s13 item 28 - the D8 silent timer restarts
+  psh->bBypass = TRUE;         // 07 s13 item 27 - registration: the tail decides fallback
 };
 
 void DS3D_OnPlayPost(CSoundObject *pso) {
@@ -446,18 +533,27 @@ void DS3D_OnPlayPost(CSoundObject *pso) {
 
   if (psh->bReplay) {
     psh->bReplay = FALSE;
-    // 08 s3 step 3 - the object was re-played: release the stale buffer (orphan
-    // play-out lands in step 5; the tail commits the fresh one this frame)
-    DS3D_ReleaseBuffer(psh);
+    // 99 #17 - the object was re-played while our shadow buffer was playing: non-forced
+    // release for non-looping buffers (detach, plays out; a not-playing buffer is just
+    // released), force release for looping ones (07 s15). bReplayLooping: the OLD
+    // buffer's loop state (bLooping is already the new play's). The tail commits the
+    // fresh one this frame
+    DS3D_DetachToOrphan(psh, psh->bReplayLooping);
   }
   // the (re)commit itself is lazy - the DS3D_DriverTail commit (08 s4 step 3)
 };
 
 void DS3D_OnStop(CSoundObject *pso) {
-  // explicit Stop/Stop_internal only (Play_internal inlines Stop_internal - 05 s1.3);
-  // force release, orphan play-out lands in step 5
+  // explicit Stop/Stop_internal only (Play_internal inlines Stop_internal - 05 s1.3)
+  // and the original already ran (08 s3): detach per DS3D_DetachToOrphan (non-looping:
+  // orphan play-out; looping: force release - 07 s15) and drop the entry
   if (_pSound == NULL) return;
   CTSingleLock slSounds(&_pSound->sl_csSound, TRUE); // recursive - Stop() already holds it
+
+  DS3DShadow *psh = DS3D_Find(pso);
+  if (psh == NULL) return;
+
+  DS3D_DetachToOrphan(psh, psh->bLooping);
   DS3D_RemoveEntry(pso);
 };
 
@@ -515,6 +611,13 @@ void DS3D_OnSetFormatPre(void) {
   while (!_mapTemplates.empty()) {
     if (_mapTemplates.begin()->second.pbuf != NULL) _mapTemplates.begin()->second.pbuf->Release();
     _mapTemplates.erase(_mapTemplates.begin());
+  }
+
+  // 08 s3 G6 - orphan interfaces die with the device too; release while it is still
+  // alive (step-5 orphan play-out list - "mark generation", 07 sG6)
+  while (!_lstOrphans.empty()) {
+    DS3D_ReleaseOrphan(_lstOrphans.back());
+    _lstOrphans.pop_back();
   }
 
   // 08 s11 step 4 / G6 - release ALL shadows via ReleaseForRecommit: the entries are
@@ -754,7 +857,9 @@ static int DS3D_FailShadow(DS3DShadow *psh, HRESULT hr) {
 
 // 08 s4 steps 4-9 - drive one committed shadow (05-step-4 split: gates + failure policy).
 // Caller holds sl_csSound, has validated SOF_PLAY and refreshed the cached format.
-static int DS3D_DriveShadow(DS3DShadow *psh, BOOL bGamePaused) {
+// fVolEff = stored volume with the master factor already applied (07 sG10b) - the D8
+// gate consumed the same value in the tail (08 s4 step 2).
+static int DS3D_DriveShadow(DS3DShadow *psh, BOOL bGamePaused, FLOAT fVolEff) {
   CSoundObject *pso = psh->psoOwner;
   LPDIRECTSOUNDBUFFER pbuf = psh->pBuffer;
 
@@ -795,9 +900,22 @@ static int DS3D_DriveShadow(DS3DShadow *psh, BOOL bGamePaused) {
     }
 
   } else {
-    // volume + frequency - IMMEDIATE (99 #6)
-    static CSymbolPtr pfSoundVolume("snd_fSoundVolume");
-    FLOAT fVol = psh->fLastVolume * pfSoundVolume.GetFloat(); // master factor (07 sG10b)
+    // volume + frequency - IMMEDIATE (99 #6). fVolEff is the master-applied stored
+    // volume (07 sG10b). Same-sounds budget (99 #9, 07 s13 item 26): per-frame running
+    // sum per CSoundData; an entry keeps its volume only if volume + running <=
+    // snd_iMaxSameSounds, else volume 0 (committed, still counted as a voice).
+    FLOAT fVol = fVolEff;
+
+    if (fVol > 0.005f) {
+      FLOAT &fRunning = _mapSameRunning[psh->psdKey]; // opaque key only (item 12)
+      const FLOAT fMax = (FLOAT)Clamp((LONG)_snd_iMaxSameSounds, 1L, 99L);
+
+      if (fRunning + fVol <= fMax) {
+        fRunning += fVol;
+      } else {
+        fVol = 0.0f;
+      }
+    }
 
     SLONG slCb;
     if (fVol <= 0.005f) {
@@ -853,12 +971,65 @@ static int DS3D_DriveShadow(DS3DShadow *psh, BOOL bGamePaused) {
   return DS3D_KEEP;
 };
 
+// 99 #15 - live voices = shadows holding a buffer (the channel table is the live-shadow
+// list itself - 08 s8). Silent entries never reach a commit, so they never consume a
+// voice (07 s13 item 25); parked (held+silent) buffers still occupy their channel for
+// the <= 10 s window of item 24.
+static INDEX DS3D_CountLiveVoices(void) {
+  INDEX ctLive = 0;
+
+  for (se1::map<CSoundObject *, DS3DShadow *>::iterator it = _mapShadows.begin();
+       it != _mapShadows.end(); it++) {
+    if (it->second->pBuffer != NULL) ctLive++;
+  }
+  return ctLive;
+};
+
+// 99 #15 - steal candidate: the live channel with the lowest stored volume (the
+// master factor scales all candidates equally, so the comparison is order-safe)
+static DS3DShadow *DS3D_FindLowestLive(void) {
+  DS3DShadow *pstLowest = NULL;
+  FLOAT fLowest = 2.0f; // above any stored 0..1 volume
+
+  for (se1::map<CSoundObject *, DS3DShadow *>::iterator it = _mapShadows.begin();
+       it != _mapShadows.end(); it++) {
+    DS3DShadow *psh = it->second;
+    if (psh->pBuffer == NULL) continue;
+
+    if (psh->fLastVolume < fLowest) {
+      fLowest = psh->fLastVolume;
+      pstLowest = psh;
+    }
+  }
+  return pstLowest;
+};
+
+// 04 s3/s4 - beta per-frame drive order (PlayBuffers): stored volume descending, then
+// distance ascending (comparator FUN_10081f00 / LC SoundLibrary.cpp:1018-1042)
+struct DS3DDriveEntry {
+  CSoundObject *pso;
+  FLOAT fVolume;
+  FLOAT fDistance;
+};
+
+static int DS3D_CompareDriveEntries(const void *p1, const void *p2) {
+  const DS3DDriveEntry &e1 = *(const DS3DDriveEntry *)p1;
+  const DS3DDriveEntry &e2 = *(const DS3DDriveEntry *)p2;
+
+  if (e1.fVolume > e2.fVolume) return -1;
+  if (e1.fVolume < e2.fVolume) return 1;
+  if (e1.fDistance < e2.fDistance) return -1;
+  if (e1.fDistance > e2.fDistance) return 1;
+  return 0;
+};
+
 // 08 s4 - the per-frame driver tail, called after the original UpdateSounds (which
 // released sl_csSound on return, SoundLibrary.cpp:1001): table validation, SOF_PAUSED
-// gate, delay advance, lazy commit and driver steps 4-9 per shadow, then ONE
+// gate, delay advance, D8 silence gate (step 2), lazy commit with voice budget/steal
+// (step 3), driver steps 4-9 per shadow in beta (sorted) order, orphan scan, then ONE
 // CommitDeferredSettings
 void DS3D_DriverTail(void) {
-  if (_mapShadows.size() == 0) return; // fast path: mode off / nothing registered
+  if (_mapShadows.size() == 0 && _lstOrphans.empty()) return; // fast path: mode off / nothing registered
   if (_pSound == NULL || _pSound->sl_pDS == NULL || _pSound->sl_pDSListener == NULL) return;
 
   CTSingleLock slSounds(&_pSound->sl_csSound, TRUE); // OPTEX-recursive (08 s7)
@@ -867,7 +1038,16 @@ void DS3D_DriverTail(void) {
   CTimerValue tvNow = _pTimer->GetHighPrecisionTimer();
   CTimerValue tvLast(_llDS3DLastTail);
   _llDS3DLastTail = tvNow.tv_llValue;
-  FLOAT fFrameSecs = Clamp((FLOAT)(tvNow - tvLast).GetSeconds(), 0.0f, 0.25f);
+  const FLOAT fFrameSecs = Clamp((FLOAT)(tvNow - tvLast).GetSeconds(), 0.0f, 0.25f);
+
+  // 07 s13 item 24 - the D8 silent-since timer runs on the beta's clock: game tick
+  // (frozen while the game does not advance), real time for SOF_NONGAME sounds
+  const TIME tmTick = _pTimer->CurrentTick();
+  const FLOAT fTickSecs = Clamp((FLOAT)(tmTick - _fDS3DLastTick), 0.0f, 0.25f);
+  _fDS3DLastTick = tmTick;
+
+  // 99 #9 - same-sounds budget sums restart every frame (07 s13 item 26)
+  _mapSameRunning.clear();
 
   // 08 s4 step 6 - the game-pause gate uses the stock MixSounds expression
   // (SoundLibrary.cpp:1284). _pNetwork==NULL counts as not paused (IsPaused()
@@ -877,18 +1057,44 @@ void DS3D_DriverTail(void) {
     bGamePaused = _pNetwork->IsPaused() || (_pNetwork->IsServer() && _pNetwork->GetLocalPause());
   }
 
+  // 99 #15 - voice budget (clamped 4..64) and the per-tail master factor for the D8
+  // gate ("storedVol x snd_fSoundVolume < 0.005" - 07 s13 item 21)
+  const INDEX iMaxVoices = (INDEX)Clamp((LONG)_snd_iMaxVoices, 4L, 64L);
+  static CSymbolPtr pfSoundVolume("snd_fSoundVolume");
+  const FLOAT fMaster = pfSoundVolume.GetFloat();
+
   BOOL bAnyBuffer = FALSE;
 
-  se1::map<CSoundObject *, DS3DShadow *>::iterator it = _mapShadows.begin();
-  while (it != _mapShadows.end()) {
-    CSoundObject *pso = it->first;
-    DS3DShadow *psh = it->second;
+  // 04 s3/s4 + 08 s8 - beta per-frame order: drive the table sorted by stored volume
+  // descending, then distance ascending (required for the voice steal). Snapshot the
+  // owner pointers; each is re-validated against the table because this pass removes
+  // entries (freed shadows must not be dereferenced).
+  const INDEX ctSorted = (INDEX)_mapShadows.size();
+  DS3DDriveEntry *aSorted = NULL;
+
+  if (ctSorted > 0) {
+    aSorted = new DS3DDriveEntry[ctSorted];
+
+    INDEX iSorted = 0;
+    for (se1::map<CSoundObject *, DS3DShadow *>::iterator it = _mapShadows.begin();
+         it != _mapShadows.end(); it++) {
+      aSorted[iSorted].pso = it->first;
+      aSorted[iSorted].fVolume = it->second->fLastVolume;
+      aSorted[iSorted].fDistance = it->second->vPos.Length();
+      iSorted++;
+    }
+    if (iSorted > 1) qsort(aSorted, iSorted, sizeof(DS3DDriveEntry), DS3D_CompareDriveEntries);
+  }
+
+  for (INDEX i = 0; i < ctSorted; i++) {
+    CSoundObject *pso = aSorted[i].pso;
+    DS3DShadow *psh = DS3D_Find(pso);
+    if (psh == NULL) continue; // removed earlier in this pass
 
     // validation: !SOF_PLAY means the engine is done with the sound (Stop clears it,
     // the stock mixer clears it for fallback entries) - plain release, no sync
     if (!(pso->so_slFlags & SOF_PLAY)) {
       DS3D_RemoveEntry(pso);
-      it = _mapShadows.begin(); // the map was mutated; restart (se1::map erase-safe)
       continue;
     }
 
@@ -908,7 +1114,6 @@ void DS3D_DriverTail(void) {
     // (05 s2.1 SOF_PAUSED test).
     if (pso->so_slFlags & SOF_PAUSED) {
       DS3D_ReleaseForRecommit(psh); // idempotent after the first frame
-      it++;
       continue;
     }
 
@@ -919,34 +1124,88 @@ void DS3D_DriverTail(void) {
       psh->bDelayPending = (pso->so_sp.sp_fDelay > 0.0f && pso->so_fDelayed < pso->so_sp.sp_fDelay);
     }
 
-    // 08 s4 step 3 - lazy commit (step-4: no silence gate / budget - step 5)
+    // 2. D8 silence gate (07 s13 items 21-25): post-master, pre-budget
+    const FLOAT fVolEff = psh->fLastVolume * fMaster;
+    const BOOL bSilent = (fVolEff < 0.005f); // beta const 0.005 (0x101b95cc)
+
+    if (bSilent) {
+      if (psh->pBuffer == NULL) {
+        // item 22 - not held: no commit attempt, no voice slot, no DS calls at all;
+        // audible-software-not (silent) fallback via the stock mixer; recommit on a
+        // later tail once audible again (item 23)
+        psh->bBypass = FALSE;
+        continue;
+      }
+
+      // item 24 - held + silent: keep parked (steps 4-9 below set the sentinel
+      // position + SetVolume(-10000)); after > 10 s of silence release to
+      // software-silent, recommit at the live offset once audible again
+      psh->tmSilentSince += ((pso->so_slFlags & SOF_NONGAME) ? fFrameSecs : fTickSecs);
+
+      if (psh->tmSilentSince > 10.0) { // beta const 10.0 (0x101b95c8)
+        DS3D_ReleaseForRecommit(psh);
+        psh->bBypass = FALSE;
+        continue;
+      }
+
+    } else {
+      psh->tmSilentSince = 0.0; // audible - timer cleared (beta 0x10082b1a-0x10082b21)
+    }
+
+    // 3. ensure committed (08 s4 step 3; silent entries never reach this point, so
+    // they never consume a voice)
     if (psh->pBuffer == NULL) {
+      DS3DShadow *pstVictim = NULL;
+
+      if (DS3D_CountLiveVoices() >= iMaxVoices) {
+        // voice budget full - steal the lowest-volume live channel only if the new
+        // sound is clearly louder (99 #15, beta const 0.333 / 0x101b95bc)
+        pstVictim = DS3D_FindLowestLive();
+
+        if (pstVictim == NULL || fVolEff - pstVictim->fLastVolume * fMaster <= 0.333f) {
+          // budget denied this frame - audible software fallback, retried every tail
+          // (07 s13 item 19 - deviation from 99 #15's silence, by design)
+          psh->bBypass = FALSE;
+          continue;
+        }
+      }
+
       if (!DS3D_CommitShadow(psh)) {
         // G9.1 - creation failure: DropToSoftware (sync inert, nothing was poisoned)
         DS3D_NoticeOnce(_bDS3DNoticeCommit, "DS3D: shadow buffer creation failed - sound left to the software mixer\n");
         DS3D_DropToSoftware(psh);
-        it = _mapShadows.begin(); // the map was mutated; restart
         continue;
+      }
+
+      psh->bBypass = TRUE; // 07 s13 item 19 - back to the shadow path on success
+
+      if (pstVictim != NULL) {
+        // steal victim: sync at steal time, then audible software continues from the
+        // synced offset (07 sG4d/99 #15; re-commit at the then-live offset)
+        DS3D_ReleaseForRecommit(pstVictim);
+        pstVictim->bBypass = FALSE;
       }
     }
 
-    const int eDrive = DS3D_DriveShadow(psh, bGamePaused);
+    const int eDrive = DS3D_DriveShadow(psh, bGamePaused, fVolEff);
 
     if (eDrive == DS3D_KEEP) {
       bAnyBuffer = TRUE;
-      it++;
       continue;
     }
     if (eDrive == DS3D_FINISHED) {
       // step 8 fired - plain release + drop (the engine unlinks on the next update)
-      DS3D_ReleaseBuffer(psh);
-      delete psh;
-      it = _mapShadows.erase(it);
+      DS3D_RemoveEntry(pso);
       continue;
     }
     // DS3D_DROPPED - DropToSoftware already erased the entry
-    it = _mapShadows.begin();
   }
+
+  delete[] aSorted;
+
+  // 99 #17 - orphan scan: buffers detached from stopped/re-played shadows play out
+  // and are released here once DS reports them done
+  DS3D_ScanOrphans();
 
   // 99 #6 - one commit per frame, on the listener (the DS object that owns it)
   if (bAnyBuffer) _pSound->sl_pDSListener->CommitDeferredSettings();

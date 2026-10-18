@@ -287,10 +287,13 @@ void CSoundObjDSPatch::P_Play_internal(CSoundData *pCsdLink, SLONG slFlags) {
   DS3D_OnPlayPost(this);
 };
 
-// 08 s3 P_Stop_internal - explicit stops only; force release (orphan play-out in step 5)
+// 08 s3 P_Stop_internal - explicit stops only; original first (it clears the engine
+// state and releases the channel), then the shadow detaches: non-looping still-playing
+// buffers go to the orphan list (99 #17 play-out), looping ones are force-released
+// (07 s15)
 void CSoundObjDSPatch::P_Stop_internal(void) {
-  DS3D_OnStop(this);
   (this->*pDS_Stop_internal)();
+  DS3D_OnStop(this);
 };
 
 // 08 s3/07 s12.1 P_dtor - release the shadow BEFORE the original (its Stop_internal

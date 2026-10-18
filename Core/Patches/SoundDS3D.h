@@ -89,7 +89,8 @@ struct DS3DShadow {
   BOOL bSpatialValid;            // set by the P_Update3DEffects store (07 s13 item 18)
   BOOL bBypass;                  // P_MixSound skips only when set (07 s13 item 19)
   BOOL bGateStopped;             // step-4 gate consumed by the re-Play (07 s13 item 20)
-  BOOL bReplay;                  // P_Play_internal: stale buffer pending release
+  BOOL bReplay;                  // re-play: stale buffer pending detach (07 s15: loops force-released)
+  BOOL bReplayLooping;           // re-play: OLD buffer's loop state for the detach (bLooping is already the new play's)
   FLOAT3D vPos;                  // stored listener-space position, engine space (02 s2)
   FLOAT3D vVel;                  // stored listener-space velocity (02 s5)
   FLOAT fLastVolume;             // stored engine volume 0..1, pre-master (08 s4 step 6)
@@ -107,7 +108,7 @@ struct DS3DShadow {
 // explicitly; OPTEX is recursive - 08 s7).
 void DS3D_OnPlayPre(CSoundObject *pso, CSoundData *psd, SLONG slFlags);
 void DS3D_OnPlayPost(CSoundObject *pso);
-void DS3D_OnStop(CSoundObject *pso);
+void DS3D_OnStop(CSoundObject *pso); // detach: non-looping -> orphan play-out; looping -> force release (07 s15)
 void DS3D_OnDtor(CSoundObject *pso);
 void DS3D_OnClearBuffer(CSoundData *psd);
 void DS3D_OnSetFormatPre(void);
